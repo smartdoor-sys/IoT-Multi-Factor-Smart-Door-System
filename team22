@@ -1,0 +1,394 @@
+// team22.cpp : 此文件包含 "main" 函数。程序执行将在此处开始并结束。
+//
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_set>
+
+#include <pigpio.h>
+
+#include <nfc/nfc.h>
+
+// 需要你把 httplib.h 放在同目录（cpp-httplib 单头文件）
+#include "httplib.h"
+
+using namespace std::chrono;
+
+// ===================== 配置区 =====================
+struct Config {
+    // GPIO
+    int door_gpio = 17;     // 门磁输入
+    int buzzer_gpio = 18;   // 蜂鸣器输出
+    int lock_gpio = 23;     // 继电器/电锁输出（没有就设为 -1）
+    bool lock_active_high = true; // 继电器高电平吸合？低电平触发就设 false
+
+    // 行为参数
+    double unlock_seconds = 2.0;  // 开锁保持
+    double grace_seconds = 8.0;  // 授权窗口：这段时间内门开不报警
+    double alarm_period_s = 0.7;  // 报警节奏周期（你可调）
+
+    // 远程控制
+    std::string bind_ip = "0.0.0.0";
+    int http_port = 5000;
+    std::string api_token = "CHANGE_ME_TO_RANDOM_LONG_TOKEN";
+
+    // NFC
+    // libnfc 的 connstring：常见 I2C "pn532_i2c:/dev/i2c-1"，SPI "pn532_spi:/dev/spidev0.0:500000" 等
+    std::string nfc_connstring = "pn532_i2c:/dev/i2c-1";
+    std::unordered_set<std::string> allowed_uids = {
+        // 把你白名单 UID（小写 hex）填进来，例如 "04a2241f9c3a80"
+    };
+};
+
+static Config CFG;
+
+// ===================== 全局状态（线程安全） =====================
+static std::atomic<bool> g_running{ true };
+
+static std::mutex g_state_mtx;
+// 授权截止时间点（steady_clock）
+static steady_clock::time_point g_access_granted_until = steady_clock::time_point::min();
+// 是否正在报警
+static std::atomic<bool> g_alarm_active{ false };
+
+// 防止重复刷卡（同一张卡短时间重复）
+static std::mutex g_uid_mtx;
+static std::string g_last_uid;
+static steady_clock::time_point g_last_uid_time = steady_clock::time_point::min();
+
+// ===================== 工具函数 =====================
+static std::string now_str() {
+    auto t = std::time(nullptr);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%F %T", std::localtime(&t));
+    return buf;
+}
+
+static void log(const std::string& s) {
+    std::cout << "[" << now_str() << "] " << s << std::endl;
+}
+
+static bool in_authorized_window() {
+    std::lock_guard<std::mutex> lk(g_state_mtx);
+    return steady_clock::now() <= g_access_granted_until;
+}
+
+static void set_authorized_window(double seconds) {
+    std::lock_guard<std::mutex> lk(g_state_mtx);
+    g_access_granted_until = steady_clock::now() + milliseconds((int)(seconds * 1000));
+}
+
+static void lock_set(bool on) {
+    if (CFG.lock_gpio < 0) return;
+    // 根据 active_high 决定输出电平
+    int level = on ? (CFG.lock_active_high ? 1 : 0) : (CFG.lock_active_high ? 0 : 1);
+    gpioWrite(CFG.lock_gpio, level);
+}
+
+static void unlock_for_seconds(double seconds) {
+    if (CFG.lock_gpio < 0) {
+        log("Unlock requested but lock_gpio=-1 (no lock wired).");
+        return;
+    }
+    log("LOCK: OPEN");
+    lock_set(true);
+    std::this_thread::sleep_for(milliseconds((int)(seconds * 1000)));
+    lock_set(false);
+    log("LOCK: CLOSED");
+}
+
+// ===================== 报警线程 =====================
+static void buzzer_on(bool on) {
+    gpioWrite(CFG.buzzer_gpio, on ? 1 : 0);
+}
+
+static void alarm_start(const std::string& reason) {
+    bool expected = false;
+    if (!g_alarm_active.compare_exchange_strong(expected, true)) {
+        return; // 已经在报警
+    }
+    log("ALARM START (" + reason + ")");
+}
+
+static void alarm_stop(const std::string& reason) {
+    bool expected = true;
+    if (!g_alarm_active.compare_exchange_strong(expected, false)) {
+        return; // 本来就没报警
+    }
+    buzzer_on(false);
+    log("ALARM STOP (" + reason + ")");
+}
+
+static void alarm_loop() {
+    // 简单“嘟嘟嘟”节奏
+    while (g_running.load()) {
+        if (!g_alarm_active.load()) {
+            std::this_thread::sleep_for(milliseconds(50));
+            continue;
+        }
+        // 一个周期内的蜂鸣节奏
+        buzzer_on(true);
+        std::this_thread::sleep_for(milliseconds(120));
+        buzzer_on(false);
+        std::this_thread::sleep_for(milliseconds(80));
+        buzzer_on(true);
+        std::this_thread::sleep_for(milliseconds(120));
+        buzzer_on(false);
+        std::this_thread::sleep_for(milliseconds((int)(CFG.alarm_period_s * 1000)));
+    }
+    buzzer_on(false);
+}
+
+// ===================== 授权动作（NFC/远程通用） =====================
+static void grant_access(const std::string& source) {
+    set_authorized_window(CFG.grace_seconds);
+    log("ACCESS GRANTED by " + source + " (grace " + std::to_string(CFG.grace_seconds) + "s)");
+
+    // 你要求：报警时可用刷卡或远程关闭，所以授权同时消警
+    alarm_stop("cleared by " + source);
+
+    // 开锁放线程，避免阻塞
+    std::thread([=] { unlock_for_seconds(CFG.unlock_seconds); }).detach();
+}
+
+static void clear_alarm_only(const std::string& source) {
+    alarm_stop("cleared by " + source);
+}
+
+// ===================== 门磁回调（pigpio alert） =====================
+// 我们用内部上拉：门磁闭合 -> GPIO 读 0；门磁断开(门开) -> GPIO 读 1
+static void door_alert(int gpio, int level, uint32_t tick) {
+    (void)tick;
+    if (gpio != CFG.door_gpio) return;
+
+    if (level == 1) { // 门开（断开，上拉=1）
+        log("DOOR: OPEN");
+        if (in_authorized_window()) {
+            log("DOOR OPEN within authorized window -> no alarm");
+        }
+        else {
+            log("DOOR OPEN without authorization -> alarm");
+            alarm_start("door opened without auth");
+        }
+    }
+    else if (level == 0) { // 门关（导通到GND=0）
+        log("DOOR: CLOSED");
+        // 你原需求：报警后必须远程/刷卡才能关闭，所以这里不自动消警
+    }
+}
+
+// ===================== NFC（libnfc）读 UID =====================
+static std::string bytes_to_hex(const uint8_t* data, size_t len) {
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out.push_back(hex[(data[i] >> 4) & 0xF]);
+        out.push_back(hex[data[i] & 0xF]);
+    }
+    return out;
+}
+
+static bool anti_repeat_uid(const std::string& uid) {
+    std::lock_guard<std::mutex> lk(g_uid_mtx);
+    auto t = steady_clock::now();
+    if (uid == g_last_uid && (t - g_last_uid_time) < milliseconds(1200)) {
+        return false;
+    }
+    g_last_uid = uid;
+    g_last_uid_time = t;
+    return true;
+}
+
+static void nfc_loop() {
+    nfc_context* ctx = nullptr;
+    nfc_init(&ctx);
+    if (!ctx) {
+        log("FATAL: nfc_init failed");
+        return;
+    }
+
+    log("libnfc initialized");
+
+    // 打开设备：用 connstring（I2C / SPI / UART 取决于你配置与
+
+
+// 运行程序: Ctrl + F5 或调试 >“开始执行(不调试)”菜单
+// 调试程序: F5 或调试 >“开始调试”菜单
+
+// 入门使用技巧: 
+//   1. 使用解决方案资源管理器窗口添加/管理文件
+//   2. 使用团队资源管理器窗口连接到源代码管理
+//   3. 使用输出窗口查看生成输出和其他消息
+//   4. 使用错误列表窗口查看错误
+//   5. 转到“项目”>“添加新项”以创建新的代码文件，或转到“项目”>“添加现有项”以将现有代码文件添加到项目
+//   6. 将来，若要再次打开此项目，请转到“文件”>“打开”>“项目”并选择 .sln 文件
+
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{ded84f5a-87e1-48f8-aa46-6f878d6283eb}</ProjectGuid>
+    <RootNamespace>team22</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="team22.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="源文件">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="头文件">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="资源文件">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="team22.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup />
+</Project>
