@@ -11,9 +11,9 @@ facerec = dlib.face_recognition_model_v1(
     "dlib_face_recognition_resnet_model_v1.dat"
 )
 
-# Create database
-conn = sqlite3.connect("faces.db")
-cursor = conn.cursor()
+# database Initailise
+dataset = sqlite3.connect("faces.db")
+cursor = dataset.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
@@ -48,8 +48,8 @@ embedding = np.array(facerec.compute_face_descriptor(rgb, shape))
 blob = pickle.dumps(embedding)
 
 cursor.execute("INSERT INTO users (name, embedding) VALUES (?, ?)", (name, blob))
-conn.commit()
+dataset.commit()
 
 print("User enrolled successfully!")
 
-conn.close()
+dataset.close()

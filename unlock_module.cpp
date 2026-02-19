@@ -9,9 +9,9 @@
 #include <cmath>
 #include <unistd.h>
 
-#define RELAY_PIN 17
-#define REED_PIN 27
-#define CHIPNAME "gpiochip0"
+#define RELAY_PIN 17 // GPIO based on the pins availabe 
+#define REED_PIN 27     // Currently they are random pins
+#define CHIPNAME "GPIO1.0"
 
 struct User {
     int id;
