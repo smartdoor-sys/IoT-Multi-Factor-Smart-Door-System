@@ -1,0 +1,39 @@
+Flow Chart for C++:
+
+
+
+
+
+
+
+
+
+
+
+Basic Structure:
+1. Classes - 
+    1.1 facerecognition
+    1.2 database 
+    1.3 reedswitch
+    1.4 systemcoord
+
+
+Project Structure:
+
+Project/
+│
+├── src/
+│   ├── FaceRecognition.cpp
+│   ├── Database.cpp
+│   ├── ReedSwitch.cpp
+│   ├── System.cpp
+│   └── main.cpp
+│
+├── include/
+│   ├── FaceRecognition.h
+│   ├── Database.h
+│   ├── ReedSwitch.h
+│   └── System.h
+│
+├── CMakeLists.txt
+└── Makefile
